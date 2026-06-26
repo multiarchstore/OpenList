@@ -12,7 +12,7 @@ on:
         required: true
         default: 'openlist-git'
       owner:
-        description: 'The owner of the package (organization or user)'
+        description: 'The owner of the package (user or organization)'
         required: false
         default: 'openlistteam'
       older_than:
@@ -25,7 +25,7 @@ on:
         # We do this because multi-arch docker containers will be pushed as separate untagged images 
         # to the container registry and GitHub cannot recognize them as part of a tagged image. 
         # Setting this option large enough prevents accidental deletion of one of these images.
-        # Here we set it to 30 seconds
+        # Here we set it to 10 seconds
         default: '10000'
       token:
         description: 'GitHub token with permissions to delete packages (leave empty to use default GITHUB_TOKEN)'
@@ -44,10 +44,10 @@ jobs:
         shell: bash
         run: |
           PACKAGE="${{ github.event.inputs.package || 'openlist-git' }}"
-          OLDER="${{ github.event.inputs.older_than || '7' }}"
-          TOLERANCE_VAL="${{ github.event.inputs.untagged_timestamp_tolerance || '0' }}"
+          OLDER="${{ github.event.inputs.older_than || '-1' }}"
+          TOLERANCE_VAL="${{ github.event.inputs.untagged_timestamp_tolerance || '10000' }}"
           TOKEN_INPUT="${{ github.event.inputs.token || '' }}"
-          OWNER="${{ github.event.inputs.owner || '' }}"
+          OWNER="${{ github.event.inputs.owner || 'openlistteam' }}"
 
           echo "package_name=$PACKAGE" >> "$GITHUB_OUTPUT"
           echo "older_than=$OLDER" >> "$GITHUB_OUTPUT"
@@ -70,6 +70,26 @@ jobs:
           command -v curl >/dev/null 2>&1 || { echo "::error::curl is required but not installed."; exit 1; }
           command -v jq >/dev/null 2>&1 || { echo "::error::jq is required but not installed."; exit 1; }
 
+      - name: Determine owner type (user or organization)
+        id: owner_type
+        shell: bash
+        run: |
+          OWNER="${{ steps.setup.outputs.owner }}"
+          TOKEN="${{ steps.setup.outputs.token }}"
+
+          TYPE=$(curl -s -H "Authorization: token $TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/users/${OWNER}" | jq -r '.type')
+
+          if [[ "$TYPE" == "Organization" ]]; then
+            OWNER_PATH="orgs"
+          else
+            OWNER_PATH="users"
+          fi
+
+          echo "owner_path=$OWNER_PATH" >> "$GITHUB_OUTPUT"
+          echo "Detected owner type: $TYPE (using /${OWNER_PATH}/)"
+
       - name: Access all versions from GitHub
         id: fetch
         shell: bash
@@ -77,8 +97,9 @@ jobs:
           PACKAGE_NAME="${{ steps.setup.outputs.package_name }}"
           OWNER="${{ steps.setup.outputs.owner }}"
           TOKEN="${{ steps.setup.outputs.token }}"
-          
-          BASE_URL="https://api.github.com/orgs/${OWNER}/packages/container/${PACKAGE_NAME}/versions"
+          OWNER_PATH="${{ steps.owner_type.outputs.owner_path }}"
+
+          BASE_URL="https://api.github.com/${OWNER_PATH}/${OWNER}/packages/container/${PACKAGE_NAME}/versions"
           URL="${BASE_URL}?per_page=100"
           TEMP_FILE="/tmp/all_versions.ndjson"
 
@@ -163,18 +184,19 @@ jobs:
           PACKAGE_NAME="${{ steps.setup.outputs.package_name }}"
           OWNER="${{ steps.setup.outputs.owner }}"
           TOKEN="${{ steps.setup.outputs.token }}"
+          OWNER_PATH="${{ steps.owner_type.outputs.owner_path }}"
           DELETE_COUNT="${{ steps.filter.outputs.delete_count }}"
           TO_DELETE='${{ steps.filter.outputs.to_delete }}'
 
           if [[ "$DELETE_COUNT" -gt 0 && -n "$TO_DELETE" ]]; then
             while IFS= read -r item; do
               [[ -z "$item" ]] && continue
-              
+
               # $item 是完整的单行 JSON，如 {"id":123,"name":"sha256:..."}
               ID=$(echo "$item" | jq -r '.id')
               NAME=$(echo "$item" | jq -r '.name')
-              
-              DELETE_URL="https://api.github.com/orgs/${OWNER}/packages/container/${PACKAGE_NAME}/versions/${ID}"
+
+              DELETE_URL="https://api.github.com/${OWNER_PATH}/${OWNER}/packages/container/${PACKAGE_NAME}/versions/${ID}"
               
               HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
                 -H "Authorization: token $TOKEN" \
